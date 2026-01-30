@@ -9,7 +9,17 @@ import subprocess
 LOG_FILE = "connections.log"
 WHITE_FILE = "list/white.list"
 BLACK_FILE = "list/black.list"
-BLOCK_THRESHOLD = 30
+
+BLOCK_THRESHOLD = 50
+TIME_WINDOW = 60
+DDOS_WINDOW = 5
+DDOS_ALERT = 100
+DDOS_BLOCK = 300
+DECAY_FACTOR = 0.7
+
+BASTION_IP = "10.10.10.111"
+INTERNAL_NET_PREFIX = "192.168.11."
+
 BPF_FILTER = "(tcp port 22 or tcp port 80) or net 192.168.11.0/24"
 
 # ===== LOAD LISTS =====
@@ -24,18 +34,35 @@ BLACKLIST = load_list(BLACK_FILE)
 
 # ===== DATA =====
 stats = defaultdict(lambda: {
-    "syn": 0,
-    "ssh": 0,
+    "syn_times": [],
+    "ssh_times": [],
+    "ddos_times": [],
+    "vscan_ports": defaultdict(set),
+    "hscan_targets": defaultdict(set),
     "vscan": 0,
     "hscan": 0,
-    "ports": defaultdict(set),
-    "targets": defaultdict(set),
     "score": 0,
     "blocked": False
 })
 
 lock = threading.Lock()
-packets_since_last = 0
+
+# ===== UTIL =====
+def is_incoming(ip_dst):
+    return ip_dst == BASTION_IP or ip_dst.startswith(INTERNAL_NET_PREFIX)
+
+def cleanup(ip):
+    now = time.time()
+    stats[ip]["syn_times"] = [t for t in stats[ip]["syn_times"] if now - t < TIME_WINDOW]
+    stats[ip]["ssh_times"] = [t for t in stats[ip]["ssh_times"] if now - t < TIME_WINDOW]
+    stats[ip]["ddos_times"] = [t for t in stats[ip]["ddos_times"] if now - t < DDOS_WINDOW]
+
+def decay_scores():
+    while True:
+        time.sleep(60)
+        with lock:
+            for ip in stats:
+                stats[ip]["score"] *= DECAY_FACTOR
 
 # ===== LOG =====
 def log_event(ip, action):
@@ -51,7 +78,6 @@ def apply_iptables_block(ip):
     result = subprocess.call(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
     return result == 0
 
-# ===== PERSIST BLACKLIST =====
 def add_to_blacklist(ip):
     if ip in BLACKLIST:
         return
@@ -59,7 +85,6 @@ def add_to_blacklist(ip):
         f.write(ip + "\n")
     BLACKLIST.add(ip)
 
-# ===== BLOCK LOGIC =====
 def block_ip(ip):
 
     if ip in WHITELIST:
@@ -79,67 +104,96 @@ def update_score(ip, points):
 
 # ===== PACKET HANDLER =====
 def packet_callback(pkt):
-    global packets_since_last
 
-    if not pkt.haslayer(IP):
+    if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
         return
 
     ip_src = pkt[IP].src
     ip_dst = pkt[IP].dst
-    packets_since_last += 1
+    tcp = pkt[TCP]
+
+    if not is_incoming(ip_dst):
+        return
 
     with lock:
 
+        # Si IP déjà blacklist → applique iptables
         if ip_src in BLACKLIST and not stats[ip_src]["blocked"]:
             apply_iptables_block(ip_src)
             stats[ip_src]["blocked"] = True
 
-        if pkt.haslayer(TCP):
-            tcp = pkt[TCP]
+        now = time.time()
 
-            if tcp.flags == "S":
-                stats[ip_src]["syn"] += 1
-                update_score(ip_src, 1)
-                log_event(ip_src, "SYN packet")
+        # SYN
+        if tcp.flags == "S":
+            stats[ip_src]["syn_times"].append(now)
 
-            if tcp.dport == 22:
-                stats[ip_src]["ssh"] += 1
-                log_event(ip_src, "SSH attempt")
+        # SSH
+        if tcp.dport == 22:
+            stats[ip_src]["ssh_times"].append(now)
 
-                if stats[ip_src]["ssh"] > 10:
-                    update_score(ip_src, 6)
-                    log_event(ip_src, "SSH BRUTE FORCE suspected")
+        # DDoS tracking
+        stats[ip_src]["ddos_times"].append(now)
 
-            stats[ip_src]["ports"][ip_dst].add(tcp.dport)
-            if len(stats[ip_src]["ports"][ip_dst]) > 10:
-                stats[ip_src]["vscan"] += 1
-                update_score(ip_src, 4)
-                log_event(ip_src, "Vertical scan detected")
+        # VERTICAL SCAN
+        stats[ip_src]["vscan_ports"][ip_dst].add(tcp.dport)
+        if len(stats[ip_src]["vscan_ports"][ip_dst]) > 10:
+            stats[ip_src]["vscan"] += 1
+            update_score(ip_src, 6)
+            log_event(ip_src, "Vertical scan detected")
 
-            stats[ip_src]["targets"][tcp.dport].add(ip_dst)
-            if len(stats[ip_src]["targets"][tcp.dport]) > 10:
-                stats[ip_src]["hscan"] += 1
-                update_score(ip_src, 4)
-                log_event(ip_src, "Horizontal scan detected")
+        # HORIZONTAL SCAN
+        stats[ip_src]["hscan_targets"][tcp.dport].add(ip_dst)
+        if len(stats[ip_src]["hscan_targets"][tcp.dport]) > 10:
+            stats[ip_src]["hscan"] += 1
+            update_score(ip_src, 6)
+            log_event(ip_src, "Horizontal scan detected")
+
+        cleanup(ip_src)
+
+        # SYN flood
+        if len(stats[ip_src]["syn_times"]) > 40:
+            update_score(ip_src, 5)
+            log_event(ip_src, "SYN flood suspected")
+
+        # SSH brute force
+        if len(stats[ip_src]["ssh_times"]) > 20:
+            update_score(ip_src, 8)
+            log_event(ip_src, "SSH brute force suspected")
+
+        # DDoS
+        ddos_count = len(stats[ip_src]["ddos_times"])
+
+        if ddos_count > DDOS_ALERT:
+            update_score(ip_src, 10)
+            log_event(ip_src, "DDoS suspected")
+
+        if ddos_count > DDOS_BLOCK:
+            update_score(ip_src, 50)
+            block_ip(ip_src)
 
 # ===== DASHBOARD =====
 def dashboard():
-    global packets_since_last
-
     while True:
         os.system("clear")
         print("==== BASTION IDS DASHBOARD ====\n")
-        print(f"{'IP':<18}{'Score':<8}{'SYN':<6}{'SSH':<6}{'VSCAN':<8}{'HSCAN':<8}{'PKTS':<8}{'BLK':<6}")
-        print("-"*80)
+        print(f"{'IP':<18}{'Score':<8}{'SYN':<8}{'SSH':<8}{'VSCAN':<8}{'HSCAN':<8}{'DDoS(5s)':<10}{'BLK':<6}")
+        print("-"*95)
 
         with lock:
             for ip, data in sorted(stats.items(), key=lambda x: x[1]["score"], reverse=True):
-                print(f"{ip:<18}{data['score']:<8}{data['syn']:<6}{data['ssh']:<6}{data['vscan']:<8}{data['hscan']:<8}{packets_since_last:<8}{str(data['blocked']):<6}")
+                print(f"{ip:<18}"
+                      f"{round(data['score'],1):<8}"
+                      f"{len(data['syn_times']):<8}"
+                      f"{len(data['ssh_times']):<8}"
+                      f"{data['vscan']:<8}"
+                      f"{data['hscan']:<8}"
+                      f"{len(data['ddos_times']):<10}"
+                      f"{str(data['blocked']):<6}")
 
-        packets_since_last = 0
         time.sleep(2)
 
-# ===== INIT BLACKLIST IPTABLES =====
+# ===== INIT BLACKLIST =====
 def init_blacklist():
     for ip in BLACKLIST:
         if ip not in WHITELIST:
@@ -157,4 +211,6 @@ if __name__ == "__main__":
     init_blacklist()
 
     threading.Thread(target=dashboard, daemon=True).start()
+    threading.Thread(target=decay_scores, daemon=True).start()
+
     sniff(filter=BPF_FILTER, prn=packet_callback, store=False, promisc=True)
