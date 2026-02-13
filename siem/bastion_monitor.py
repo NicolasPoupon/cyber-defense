@@ -27,10 +27,12 @@ def load_list(file_path):
     if not os.path.exists(file_path):
         return set()
     with open(file_path, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+        return set(line.strip() for line in f.readlines() if line.strip())
 
 WHITELIST = load_list(WHITE_FILE)
+print(f"Loaded whitelist: {WHITELIST if WHITELIST else 'None'}")
 BLACKLIST = load_list(BLACK_FILE)
+print(f"Loaded blacklist: {BLACKLIST if BLACKLIST else 'None'}")
 
 # ===== DATA =====
 stats = defaultdict(lambda: {
@@ -72,9 +74,20 @@ def log_event(ip, action):
 
 # ===== IPTABLES =====
 def apply_iptables_block(ip):
-    subprocess.call(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"],
+    # Ne JAMAIS bloquer les IPs critiques (réseau interne, bastion, etc.).
+    # Ceci est une double sécurité, en plus de la whitelist.
+    if ip.startswith("192.168.11.") or ip.startswith("10.10.10."):
+        log_event(ip, "CRITICAL IP - NOT BLOCKED (Safety Net)")
+        return False
+    
+    # Vérifie si la règle existe déjà
+    check = subprocess.call(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
+    # Si check == 0, la règle existe déjà
+    if check == 0:
+        return True  # Déjà bloqué
+    # Sinon ajoute la règle
     result = subprocess.call(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
     return result == 0
 
@@ -86,11 +99,8 @@ def add_to_blacklist(ip):
     BLACKLIST.add(ip)
 
 def block_ip(ip):
-
-    if ip in WHITELIST:
-        log_event(ip, "WHITELIST - NOT BLOCKED")
-        return
-
+    # La vérification de la whitelist se fait désormais au début de packet_callback.
+    # Une IP arrivant ici ne devrait pas être sur la whitelist.
     if apply_iptables_block(ip):
         add_to_blacklist(ip)
         stats[ip]["blocked"] = True
@@ -111,6 +121,10 @@ def packet_callback(pkt):
     ip_src = pkt[IP].src
     ip_dst = pkt[IP].dst
     tcp = pkt[TCP]
+
+    # Ignorer immédiatement les IPs de la whitelist pour éviter tout traitement
+    if ip_src in WHITELIST:
+        return
 
     if not is_incoming(ip_dst):
         return
@@ -141,6 +155,8 @@ def packet_callback(pkt):
             stats[ip_src]["vscan"] += 1
             update_score(ip_src, 6)
             log_event(ip_src, "Vertical scan detected")
+            # Vider l'ensemble pour réinitialiser la détection pour cette cible
+            stats[ip_src]["vscan_ports"][ip_dst].clear()
 
         # HORIZONTAL SCAN
         stats[ip_src]["hscan_targets"][tcp.dport].add(ip_dst)
@@ -148,6 +164,8 @@ def packet_callback(pkt):
             stats[ip_src]["hscan"] += 1
             update_score(ip_src, 6)
             log_event(ip_src, "Horizontal scan detected")
+            # Vider l'ensemble pour réinitialiser la détection pour ce port
+            stats[ip_src]["hscan_targets"][tcp.dport].clear()
 
         cleanup(ip_src)
 
